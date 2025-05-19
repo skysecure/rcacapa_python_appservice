@@ -1,0 +1,5 @@
+fastapi
+azure-ai-projects
+gunicorn
+uvicorn
+azure-identity
