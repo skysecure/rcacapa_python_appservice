@@ -1,5 +1,7 @@
-fastapi
-azure-ai-projects
-gunicorn
-uvicorn
+azure-ai-projects==1.0.0b10
+semantic-kernel[azure]
 azure-identity
+fastapi
+uvicorn
+python-dotenv
+gunicorn

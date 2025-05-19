@@ -1,128 +1,121 @@
-from fastapi import FastAPI, HTTPException
+import os
+import asyncio
+from typing import Dict, List
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from dotenv import load_dotenv
+from azure.identity.aio import DefaultAzureCredential
+from semantic_kernel.functions import kernel_function
+from semantic_kernel.agents import (AzureAIAgent,ConcurrentOrchestration,ChatCompletionAgent,ChatHistoryAgentThread,)
+from semantic_kernel.agents.runtime import InProcessRuntime
+from semantic_kernel.connectors.ai.open_ai import AzureChatCompletion
 from pydantic import BaseModel
-import time
-import uvicorn
-import traceback
-from azure.ai.projects import AIProjectClient
-from azure.identity import DefaultAzureCredential
+from fastapi import Body
 
-# Request schema
+load_dotenv()
+
 class ChatRequest(BaseModel):
     user_query: str
+    conversation_id: str = "default"
 
-# Initialize FastAPI
-app = FastAPI()
 
-# Initialize Azure AI Project Client
-project_client = AIProjectClient.from_connection_string(
-    credential=DefaultAzureCredential(),
-    conn_str="eastus2.api.azureml.ms;a182fe30-ddfd-4f86-9bb2-9278c2f0c684;agents;zohoagent"
+PROJECT_CONN_STR     = os.environ["PROJECT_CONN_STR"]
+AZ_OPENAI_ENDPOINT   = os.environ["AZURE_OPENAI_ENDPOINT"]
+AZ_OPENAI_DEPLOYMENT = os.environ["AZURE_OPENAI_DEPLOYMENT"]
+AZ_OPENAI_API_KEY    = os.environ["AZURE_OPENAI_API_KEY"]
+
+#Agents
+CATEGORISER_AGENT_ID = "asst_CzSz70pLt0mpDWkYDtiD2021"
+DATA_AGENT_ID        = "asst_z6Pw3Zn3nIC6SgrELiqwLoLj"
+
+# Helper to build the two member agents
+async def _build_members(client) -> List[AzureAIAgent]:
+    cat_def  = await client.agents.get_agent(CATEGORISER_AGENT_ID)
+    data_def = await client.agents.get_agent(DATA_AGENT_ID)
+    return [
+        AzureAIAgent(client=client, definition=cat_def),
+        AzureAIAgent(client=client, definition=data_def),
+    ]
+
+class IndegeneCompliancePlugin:
+    @kernel_function(
+        name="analyse_task",
+        description="Run categoriser + data agents concurrently; return their answers.",
+    )
+    async def analyse_task(self, task: str) -> str:
+        credential = DefaultAzureCredential()
+        async with credential:
+            async with AzureAIAgent.create_client(
+                credential=credential, conn_str=PROJECT_CONN_STR
+            ) as client:
+                members       = await _build_members(client)
+                orchestration = ConcurrentOrchestration(members)
+                runtime       = InProcessRuntime()
+                runtime.start()
+
+                try:
+                    fut     = await orchestration.invoke(task=task, runtime=runtime)
+                    answers = await fut.get(timeout=50)
+                    # answers[i].items[0].text → plain response text
+                    return "\n\n".join(f"{a.name}:\n{a.items[0].text}" for a in answers)
+                finally:
+                    await runtime.stop_when_idle()
+
+
+agentplugin      = IndegeneCompliancePlugin()
+host_agent  = ChatCompletionAgent(
+    service=AzureChatCompletion(
+        deployment_name=AZ_OPENAI_DEPLOYMENT,
+        endpoint=AZ_OPENAI_ENDPOINT,
+        api_key=AZ_OPENAI_API_KEY,
+    ),
+    name="Host",
+    instructions=(
+        "You are a helpful assistant.\n\n"
+        "• If the user message is ONLY a friendly greeting or general inquiry, such as reply with a brief greeting.\n"
+        "• Otherwise, ALWAYS call the tool **analyse_task** with the "
+            "full user message, then return the full tool result verbatim."
+    ),
+    plugins=[agentplugin],
 )
 
-# Load agent
-agent = project_client.agents.get_agent("asst_uMs6c90Z7hOdymAqcEqVvWZ5")
+threads: Dict[str, ChatHistoryAgentThread] = {}
 
+def get_thread(cid: str) -> ChatHistoryAgentThread:
+    """Return existing thread or create a new one for this conversation_id."""
+    if cid not in threads:
+        threads[cid] = ChatHistoryAgentThread()
+    return threads[cid]
 
-# Core chat handler with improved error resilience
-def query_with_dynamic_thread(user_input: str) -> str:
-    MAX_RETRIES = 3
-    TIMEOUT_SECONDS = 20  # Slightly under Teams 15s safety window
-    GRACE_RETRY_COUNT = 2
-    RETRY_DELAY_SECONDS = 2
+app = FastAPI()
 
-    for attempt in range(MAX_RETRIES):
-        try:
-            print(f"[Attempt {attempt + 1}] Creating thread and posting message...")
-
-            thread = project_client.agents.create_thread()
-            project_client.agents.create_message(
-                thread_id=thread.id,
-                role="user",
-                content=user_input
-            )
-
-            run = project_client.agents.create_and_process_run(
-                thread_id=thread.id,
-                agent_id=agent.id
-            )
-
-            start_time = time.time()
-
-            while True:
-                elapsed = time.time() - start_time
-                if elapsed > TIMEOUT_SECONDS:
-                    raise TimeoutError("Timed out waiting for agent run to complete.")
-
-                run_status = project_client.agents.get_run(
-                    thread_id=thread.id,
-                    run_id=run.id
-                )
-
-                if run_status.status == "completed":
-                    break
-                elif run_status.status in ["failed", "cancelled"]:
-                    raise RuntimeError(f"Run failed with status: {run_status.status}")
-
-                time.sleep(1)
-
-            # Try to collect messages normally
-            response = collect_assistant_response(thread.id)
-            if response:
-                return response
-            else:
-                raise RuntimeError("Run completed but no assistant response found.")
-
-        except (TimeoutError, RuntimeError) as e:
-            print(f"[Warning] Attempt {attempt + 1} failed: {e}")
-            # Grace retry to pull message anyway
-            for i in range(GRACE_RETRY_COUNT):
-                print(f"[Grace Retry {i + 1}] Trying to pull response after failure...")
-                fallback = collect_assistant_response(thread.id)
-                if fallback:
-                    return fallback
-                time.sleep(1)
-
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY_SECONDS)
-            else:
-                return "Still processing your request. Please wait a few seconds and try again."
-
-        except Exception as e:
-            print(f"[Fatal] Unexpected error: {str(e)}\n{traceback.format_exc()}")
-            raise HTTPException(status_code=500, detail="Unexpected internal server error.")
-
-    return "Agent failed to respond after multiple attempts. Please try again shortly."
-
-
-# Message collection helper
-def collect_assistant_response(thread_id: str) -> str:
-    try:
-        messages = project_client.agents.list_messages(thread_id=thread_id)
-        response_texts = []
-        for msg in messages.data:
-            if msg.role == "assistant":
-                for content in msg.content:
-                    if hasattr(content, "text") and content.text:
-                        response_texts.append(content.text.value)
-        return "\n".join(response_texts) if response_texts else None
-    except Exception as e:
-        print(f"[Error] Collecting message failed: {e}")
-        return None
-
-
-# API route
 @app.post("/rcacapa-query")
-async def chat(request: ChatRequest):
-    try:
-        start_time = time.time()
-        response = query_with_dynamic_thread(request.user_query)
-        duration = time.time() - start_time
-        print(f"[INFO] Total processing time: {duration:.2f}s")
-        return {"response": response}
-    except Exception as e:
-        print(f"[API ERROR] {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+async def chat(req: ChatRequest = Body(...)):
+    thread = get_thread(req.conversation_id)
 
-# Run app (local dev)
-if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    assistant_msg = await host_agent.get_response(
+        messages=req.user_query,
+        thread=thread,
+    )
+
+    plain_response = " ".join(
+        item.text for item in assistant_msg.items
+        if getattr(item, "text", None)          # ignore tool-call items
+    )
+    return {"assistant": plain_response}
+
+
+@app.post("/rcacapa-query/stream_plain")
+async def chat_stream_plain(req: ChatRequest = Body(...)):
+    thread = get_thread(req.conversation_id)
+
+    async def gen():
+        async for chunk in host_agent.invoke_stream(
+            messages=req.user_query,
+            thread=thread,
+        ):
+            txt = getattr(chunk, "content", None)
+            if txt:
+                yield txt
+
+    return StreamingResponse(gen(), media_type="text/plain")
