@@ -16,8 +16,8 @@ from fastapi import Body
 
 load_dotenv()
 PROJECT_CONN_STR     = os.environ["PROJECT_CONN_STR"]
-CATEGORISER_AGENT_ID = "asst_VCsaavLKPoSVCO3XjhVbtY7N"
-DATA_AGENT_ID        = "asst_4WCF7KY8JkFNMjiYUGUWRGrH"
+CATEGORISER_AGENT_ID = "asst_kpcgVpZkEoX1XaWAl67RqJ5E"
+DATA_AGENT_ID        = "asst_tjBNSa3vhqralopDSHeXItHl"
 AZ_OPENAI_ENDPOINT   = os.environ["AZURE_OPENAI_ENDPOINT"]
 AZ_OPENAI_DEPLOYMENT = os.environ["AZURE_OPENAI_DEPLOYMENT"]
 AZ_OPENAI_API_KEY    = os.environ["AZURE_OPENAI_API_KEY"]
@@ -137,3 +137,7 @@ async def chat(req: ChatRequest = Body(...)):
         if getattr(item, "text", None)
     )
     return {"assistant": plain_response}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "message": "Indegene Compliance Agent is running."}
