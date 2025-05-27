@@ -2,6 +2,6 @@ azure-ai-projects==1.0.0b10
 semantic-kernel[azure]
 azure-identity
 fastapi
+gunicorn
 uvicorn
 python-dotenv
-gunicorn
